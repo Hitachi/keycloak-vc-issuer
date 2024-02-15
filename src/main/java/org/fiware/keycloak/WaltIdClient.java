@@ -146,7 +146,7 @@ public class WaltIdClient {
 			Thread.currentThread().interrupt();
 			throw new WaltIdConnectException("Was not able to create did at walt-id.", e);
 		}
-		if (response == null || response.statusCode() != 200) {
+		if (response == null || response.statusCode() != 201) {
 			throw new WaltIdConnectException("Was not able to create did at walt-id.");
 		}
 		return response.body();

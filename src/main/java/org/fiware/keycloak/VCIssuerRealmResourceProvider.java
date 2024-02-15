@@ -48,7 +48,12 @@ import org.fiware.keycloak.oidcvc.model.ProofVO;
 import org.fiware.keycloak.oidcvc.model.SupportedCredentialVO;
 import org.jboss.logging.Logger;
 import org.keycloak.OAuth2Constants;
+import org.keycloak.TokenVerifier;
+import org.keycloak.common.VerificationException;
+import org.keycloak.common.util.ObjectUtil;
 import org.keycloak.common.util.Time;
+import org.keycloak.crypto.SignatureProvider;
+import org.keycloak.crypto.SignatureVerifierContext;
 import org.keycloak.events.EventBuilder;
 import org.keycloak.models.AuthenticatedClientSessionModel;
 import org.keycloak.models.ClientModel;
@@ -63,6 +68,7 @@ import org.keycloak.protocol.oidc.utils.OAuth2Code;
 import org.keycloak.protocol.oidc.utils.OAuth2CodeParser;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.representations.JsonWebToken;
+import org.keycloak.services.Urls;
 import org.keycloak.services.managers.AppAuthManager;
 import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.resource.RealmResourceProvider;
@@ -74,6 +80,7 @@ import javax.ws.rs.BadRequestException;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.FormParam;
 import javax.ws.rs.GET;
+import javax.ws.rs.HeaderParam;
 import javax.ws.rs.NotAuthorizedException;
 import javax.ws.rs.NotFoundException;
 import javax.ws.rs.OPTIONS;
@@ -90,12 +97,14 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.fiware.keycloak.SIOP2ClientRegistrationProvider.VC_TYPES_PREFIX;
@@ -109,6 +118,8 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 	private static final Logger LOGGER = Logger.getLogger(VCIssuerRealmResourceProvider.class);
 	private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ISO_DATE_TIME
 			.withZone(ZoneId.of(ZoneOffset.UTC.getId()));
+    private static final String BEARER = "Bearer";
+    private static final Pattern WHITESPACES = Pattern.compile("\\s+");
 
 	public static final String LD_PROOF_TYPE = "LD_PROOF";
 	public static final String CREDENTIAL_PATH = "credential";
@@ -332,7 +343,7 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 						jwtVC.getTypes().add(supportedCredential.getType());
 					}
 				});
-		credentialMetadata.setFormats(Map.of(FormatVO.LDP_VC.toString(), ldpVC, FormatVO.JWT_VC.toString(), jwtVC));
+		credentialMetadata.setFormats(Map.of(FormatVO.LDP_VC.toString(), ldpVC, FormatVO.JWT_VC_JSON.toString(), jwtVC));
 		configAsMap.put("credentials_supported", Map.of(TYPE_VERIFIABLE_CREDENTIAL, credentialMetadata));
 		return Response.ok()
 				.entity(configAsMap)
@@ -448,8 +459,8 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 		assertIssuerDid(issuerDidParam);
 		LOGGER.infof("Received token request %s - %s - %s.", grantType, code, preauth);
 
-		if (Optional.ofNullable(grantType).map(gt -> !gt.equals(GRANT_TYPE_PRE_AUTHORIZED_CODE))
-				.orElse(preauth == null)) {
+        if (Optional.ofNullable(grantType).map(gt -> !gt.equals(GRANT_TYPE_PRE_AUTHORIZED_CODE)).orElse(preauth == null)
+            && Optional.ofNullable(grantType).map(gt -> !gt.equals("authorization_code")).orElse(code == null)) {
 			throw new BadRequestException(getErrorResponse(ErrorType.INVALID_TOKEN));
 		}
 		// some (not fully OIDC4VCI compatible) wallets send the preauthorized code as an alternative parameter
@@ -462,7 +473,7 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 				result.getClientSession().getUserSession().getUser(),
 				result.getClientSession().getUserSession(),
 				DefaultClientSessionContext.fromClientSessionAndScopeParameter(result.getClientSession(),
-						OAuth2Constants.SCOPE_OPENID, session));
+						getScope(result), session));
 
 		String encryptedToken = session.tokens().encodeAndEncrypt(accessToken);
 		String tokenType = "bearer";
@@ -485,6 +496,16 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 		}
 		return result;
 	}
+
+    private String getScope(OAuth2CodeParser.ParseResult parseResult) {
+        OAuth2Code codeData = parseResult.getCodeData();
+
+        if (codeData == null) {
+            return null;
+        }
+
+        return codeData.getScope();
+    }
 
 	private String generateAuthorizationCode() {
 		AuthenticationManager.AuthResult authResult = getAuthResult();
@@ -558,7 +579,7 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 			@ApiResponse(code = 200, message = "Credential Response can be Synchronous or Deferred. The Credential Issuer MAY be able to immediately issue a requested Credential and send it to the Client. In other cases, the Credential Issuer MAY NOT be able to immediately issue a requested Credential and would want to send an acceptance_token parameter to the Client to be used later to receive a Credential when it is ready.", response = CredentialResponseVO.class),
 			@ApiResponse(code = 400, message = "When the Credential Request is invalid or unauthorized, the Credential Issuer responds the error response", response = ErrorResponseVO.class) })
 	public Response requestCredential(@PathParam("issuer-did") String issuerDidParam,
-			CredentialRequestVO credentialRequestVO) {
+			CredentialRequestVO credentialRequestVO, @HeaderParam("Authorization") String authorizationHeader) {
 		assertIssuerDid(issuerDidParam);
 		LOGGER.infof("Received credentials request %s.", credentialRequestVO);
 
@@ -590,6 +611,46 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 		}
 
 		String vcType = types.get(0);
+
+        String accessTokenString = extractTokenStringFromAuthHeader(authorizationHeader);
+        AccessToken token = null;
+        try {
+            TokenVerifier<AccessToken> verifier = TokenVerifier.create(accessTokenString, AccessToken.class).withDefaultChecks()
+                .realmUrl(
+                    Urls.realmIssuer(session.getContext().getUri().getBaseUri(), session.getContext().getRealm().getName()));
+            SignatureVerifierContext verifierContext = session
+                .getProvider(SignatureProvider.class, verifier.getHeader().getAlgorithm().name())
+                .verifier(verifier.getHeader().getKeyId());
+            verifier.verifierContext(verifierContext);
+            token = verifier.verify().getToken();
+        } catch (VerificationException e) {
+            LOGGER.warnf("Was not able to parse the token: %s", accessTokenString, e);
+            throw new BadRequestException(getErrorResponse(ErrorType.INVALID_REQUEST));
+        }
+
+        String[] scopeList = token.getScope().split("\\s+");
+        List<String> allowedVcTypes = new ArrayList<>();
+        List<String> allowedVcFormats = new ArrayList<>();
+        for (String scope : scopeList) {
+            if (scope.startsWith("types_")) {
+                allowedVcTypes.add(scope.substring(6));
+            } else if (scope.startsWith("format_")) {
+                allowedVcFormats.add(scope.substring(7));
+            }
+        }
+
+        if (!allowedVcTypes.contains(vcType.toLowerCase())) {
+            LOGGER.warnf("Credential type is not allowed. Req: %s", credentialRequestVO);
+            // return Response.status(Response.Status.BAD_REQUEST).entity(new ErrorResponse("credential type is not allowed."))
+            // .header(ACCESS_CONTROL_HEADER, "*").build();
+        }
+
+        if (!allowedVcFormats.contains(requestedFormat.toString())) {
+            LOGGER.warnf("Credential format is not allowed. Req: %s", credentialRequestVO);
+            // return Response.status(Response.Status.BAD_REQUEST).entity(new ErrorResponse("credential format is not
+            // allowed."))
+            // .header(ACCESS_CONTROL_HEADER, "*").build();
+        }
 
 		CredentialResponseVO responseVO = new CredentialResponseVO();
 		// keep the originally requested here.
@@ -741,35 +802,43 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 		LOGGER.infof("Will set roles %s", roles);
 		List<String> claims = getClaimsToSet(vcType, clients);
 		LOGGER.infof("Will set %s", claims);
-		if (claims.contains("email")) {
-			Optional.ofNullable(userModel.getEmail()).filter(email -> !email.isEmpty()).ifPresent(claimsBuilder::email);
-		}
-		if (claims.contains("firstName")) {
-			Optional.ofNullable(userModel.getFirstName()).filter(firstName -> !firstName.isEmpty())
-					.ifPresent(claimsBuilder::firstName);
-		}
-		if (claims.contains("familyName")) {
-			Optional.ofNullable(userModel.getLastName()).filter(lastName -> !lastName.isEmpty())
-					.ifPresent(claimsBuilder::familyName);
-		}
-		if (claims.contains("roles")) {
-			Optional.ofNullable(roles).filter(rolesList -> !rolesList.isEmpty()).ifPresent(claimsBuilder::roles);
-		}
-		Map<String, String> additionalClaims = getAdditionalClaims(clients).map(claimsMap ->
-				claimsMap.entrySet().stream().filter(entry -> claims.contains(entry.getKey()))
-						.collect(Collectors.toMap(
-								Map.Entry::getKey, Map.Entry::getValue))
-		).orElse(Map.of());
 
-		var vcConfigBuilder = VCConfig.builder();
-		if (additionalClaims.containsKey(SUBJECT_DID)) {
-			LOGGER.infof("Set subject did to %s", additionalClaims.get(SUBJECT_DID));
-			vcConfigBuilder.subjectDid(additionalClaims.get(SUBJECT_DID));
-			additionalClaims.remove(SUBJECT_DID);
-		} else {
-			// we have to set something
-			vcConfigBuilder.subjectDid(UUID.randomUUID().toString());
-		}
+        Map<String, String> additionalClaims = new HashMap<>();
+        for (String claim : claims) {
+            switch (claim) {
+                case "email":
+                    Optional.ofNullable(userModel.getEmail()).filter(email -> !email.isEmpty()).ifPresent(claimsBuilder::email);
+                    break;
+                case "givenName":
+                    additionalClaims.put(claim, Objects.requireNonNullElse(userModel.getFirstName(), ""));
+                    break;
+                case "firstName":
+                    Optional.ofNullable(userModel.getFirstName()).filter(firstName -> !firstName.isEmpty())
+                        .ifPresent(claimsBuilder::firstName);
+                    break;
+                case "familyName":
+                    Optional.ofNullable(userModel.getLastName()).filter(lastName -> !lastName.isEmpty())
+                        .ifPresent(claimsBuilder::familyName);
+                    break;
+                case "roles":
+                    Optional.ofNullable(roles).filter(rolesList -> !rolesList.isEmpty()).ifPresent(claimsBuilder::roles);
+                    break;
+                default:
+                    additionalClaims.put(claim, Objects.requireNonNullElse(userModel.getFirstAttribute(claim), ""));
+            }
+        }
+
+        Map<String, String> additionalClientClaims = getAdditionalClaims(clients).map(claimsMap -> claimsMap.entrySet().stream()
+            .filter(entry -> claims.contains(entry.getKey())).collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)))
+            .orElse(Map.of());
+        additionalClaims.putAll(additionalClientClaims);
+
+        var vcConfigBuilder = VCConfig.builder();
+        if (userModel.getFirstAttribute(SUBJECT_DID) == null) {
+            vcConfigBuilder.subjectDid(userModel.getId());
+        } else {
+            vcConfigBuilder.subjectDid(userModel.getFirstAttribute(SUBJECT_DID));
+        }
 
 		claimsBuilder.additionalClaims(additionalClaims);
 		VCClaims vcClaims = claimsBuilder.build();
@@ -802,7 +871,7 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 				.map(Map::entrySet)
 				.flatMap(Set::stream)
 				// get the claims
-				.filter(entry -> entry.getKey().equals(String.format("%s_%s", credentialType, "claims")))
+				.filter(entry -> entry.getKey().equals(String.format("%s%s_%s", SIOP2ClientRegistrationProvider.VC_CLAIMS_PREFIX, credentialType, "claims")))
 				.findFirst()
 				.map(Map.Entry::getValue)
 				.orElse("");
@@ -890,4 +959,28 @@ public class VCIssuerRealmResourceProvider implements RealmResourceProvider {
 		private final String clientId;
 		private final List<RoleModel> roleModels;
 	}
+
+    private static String extractTokenStringFromAuthHeader(String authHeader) {
+
+        if (authHeader == null) {
+            return null;
+        }
+
+        String[] split = WHITESPACES.split(authHeader.trim());
+        if (split.length != 2) {
+            return null;
+        }
+
+        String bearerPart = split[0];
+        if (!bearerPart.equalsIgnoreCase(BEARER)) {
+            return null;
+        }
+
+        String tokenString = split[1];
+        if (ObjectUtil.isBlank(tokenString)) {
+            return null;
+        }
+
+        return tokenString;
+    }
 }
